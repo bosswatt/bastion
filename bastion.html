@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>BASTION v4</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;
+  background:#F5F5F0;
+  -webkit-tap-highlight-color:transparent;touch-action:none;user-select:none}
+canvas{display:block}
+.xbtn{position:fixed;bottom:20px;
+  width:64px;height:64px;border-radius:50%;
+  border:1.5px solid #1A1A1A;
+  font:bold 14px -apple-system,BlinkMacSystemFont,sans-serif;
+  color:#1A1A1A;cursor:pointer;z-index:10;
+  -webkit-tap-highlight-color:transparent}
+.xbtn:active{filter:brightness(0.95)}
+.xbtn:disabled{opacity:0.6;cursor:default}
+#gifbtn{right:20px;background:#E8E8E4}
+#hdbtn{right:92px;background:#DDE4DD}
+#rotl{left:20px;background:#E4E4E8;font-size:20px}
+#rotr{left:92px;background:#E4E4E8;font-size:20px}
+#zout{left:20px;bottom:92px;background:#E4E4E8;font-size:22px}
+#zin{left:92px;bottom:92px;background:#E4E4E8;font-size:22px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="rotl" class="xbtn">◄</button>
+<button id="rotr" class="xbtn">►</button>
+<button id="zout" class="xbtn">−</button>
+<button id="zin" class="xbtn">+</button>
+<button id="hdbtn" class="xbtn">HD</button>
+<button id="gifbtn" class="xbtn">GIF</button>
+<script>
+'use strict';
+
+// ════════════════════════════════════════════
+// BASTION V4 — v3 corrections + face-aware input
+// Hit detection ported from the DREADNOUGHT 04 R2
+// planometric stub: pick against rendered geometry,
+// front to back, first face containment wins; an
+// uncovered pixel is ground by construction.
+//  - blocks are fixed 3×3 groups; each cell carries
+//    its own height (1..MAXH); no drag-to-size
+//  - tap open grid = arm a footprint; tap it again
+//    = place. Tap a block = arm it; second tap on
+//    its TOP raises that cell one level, on a SIDE
+//    opens the block radial. Armed block + tap
+//    another block = freeway (as before).
+//  - drags always pan (no mode button), except a
+//    drag that started on a block face, which is
+//    reserved and does nothing.
+//  - radial gains LOWER; level seams on tall cells
+// ════════════════════════════════════════════
+
+var C=document.getElementById('c'),X=C.getContext('2d'),
+    GW=16,GH=16,HW=24,HH=12,MAXH=8,
+    RAISE_WHOLE_BLOCK=false,   // true: a top double-tap lifts all 9 cells of the block
+    GCX=(GW-1)/2,GCY=(GH-1)/2,
+    W,H,ox,oy,
+    boxes=[],hmap,hueMap,ownerMap,
+    anim=null,PM=150,
+    pendingConn=null,pendingPlace=null,
+    selectedPath=-1,radialMenu=null,
+    hueCounter=0,GA=137.508,
+    exporting=false,
+    azimuth=0,vCos=1,vSin=0,
+    isPanning=false,panSX=0,panSY=0,panOX=0,panOY=0,
+    isOrbiting=false,orbitSX=0,orbitAz=0,
+    isDown=false,downPt=null,downPick=null,moved=false,CLICK_TOL=7,
+    DASHV=0.04,        // lane dash speed px/ms (export overrides for a seamless loop)
+    activeId=null,     // the one pointer we listen to
+    dirty=true,        // static scene changed → rebuild caches
+    gridPath=null,     // Path2D of all empty-cell diamonds (screen space)
+    prismList=[];      // depth-sorted occupied cells with precomputed rgb
+
+var ZOOMS=[];for(var _i=-10;_i<=14;_i++)ZOOMS.push(Math.pow(2,_i/4));
+var zoomIdx=10;
+var RRAD=80,RNOD=28;
+
+// ════════════════════════════════════════════
+// FREEWAY: paths replace conns
+// ════════════════════════════════════════════
+var PATHS=[];  // {a:[c,r], b:[c,r], dir:1|-1|0, hue, cells:[{c,r,pk,ein,eout}]|null}
+var pathOcc;   // Map: cellIdx -> [pieceKey,...]
+
+// Six-piece vocabulary (local coords: x right, y down)
+var PIECES={
+  WE:{e:['W','E'],len:1,
+    poly:[[0,.25],[1,.25],[1,.75],[0,.75]],
+    sides:[[[0,.25],[1,.25]],[[0,.75],[1,.75]]]},
+  NS:{e:['N','S'],len:1,
+    poly:[[.25,0],[.75,0],[.75,1],[.25,1]],
+    sides:[[[.25,0],[.25,1]],[[.75,0],[.75,1]]]},
+  WN:{e:['W','N'],len:0.7071,
+    poly:[[0,.25],[.25,0],[.75,0],[0,.75]],
+    sides:[[[0,.25],[.25,0]],[[0,.75],[.75,0]]]},
+  NE:{e:['N','E'],len:0.7071,
+    poly:[[.25,0],[.75,0],[1,.25],[1,.75]],
+    sides:[[[.75,0],[1,.25]],[[.25,0],[1,.75]]]},
+  ES:{e:['E','S'],len:0.7071,
+    poly:[[1,.25],[1,.75],[.75,1],[.25,1]],
+    sides:[[[1,.75],[.75,1]],[[1,.25],[.25,1]]]},
+  SW:{e:['S','W'],len:0.7071,
+    poly:[[0,.25],[0,.75],[.25,1],[.75,1]],
+    sides:[[[0,.75],[.25,1]],[[0,.25],[.75,1]]]}
+};
+var COMP={WN:'ES',ES:'WN',NE:'SW',SW:'NE'};
+var OPP={N:'S',S:'N',E:'W',W:'E'};
+var STEP={N:[0,-1],S:[0,1],E:[1,0],W:[-1,0]};
+var EMID={N:[.5,0],S:[.5,1],W:[0,.5],E:[1,.5]};
+var EIDX={N:0,S:1,E:2,W:3};
+var ENAM=['N','S','E','W'];
+
+function pkFor(a,b){
+  if(a===b)return null;
+  for(var k in PIECES){var e=PIECES[k].e;
+    if((e[0]===a&&e[1]===b)||(e[0]===b&&e[1]===a))return k;}
+  return null;
+}
+
+function pieceFits(ci,pk){
+  if(hmap[ci]>0)return false;
+  var l=pathOcc.get(ci);
+  if(!l)return true;
+  if(l.length>=2)return false;
+  return COMP[l[0]]===pk;
+}
+
+// ════════════════════════════════════════════
+// GRID + MAPS
+// ════════════════════════════════════════════
+
+function allocGrid(){
+  hmap=new Int8Array(GH*GW);       // cell height 0..MAXH (0 = empty)
+  hueMap=new Float32Array(GH*GW);
+  ownerMap=new Int16Array(GH*GW);  // box index per cell, -1 = none
+  GCX=(GW-1)/2;GCY=(GH-1)/2;
+}
+allocGrid();
+
+function h2r(h,s,l){
+  h/=360;s/=100;l/=100;
+  if(s===0)return[~~(l*255),~~(l*255),~~(l*255)];
+  function f(p,q,t){if(t<0)t+=1;if(t>1)t-=1;if(t<1/6)return p+(q-p)*6*t;if(t<1/2)return q;if(t<2/3)return p+(q-p)*(2/3-t)*6;return p;}
+  var q=l<0.5?l*(1+s):l+s-l*s,p=2*l-q;
+  return[~~(f(p,q,h+1/3)*255),~~(f(p,q,h)*255),~~(f(p,q,h-1/3)*255)];
+}
+
+function updateView(){ox=W/2;oy=Math.max(40,(H-(GH+GW)*HH)/2);dirty=true;}
+
+function rotateView(dir){
+  azimuth=(azimuth+dir*Math.PI/32+Math.PI*8)%(Math.PI*2);
+  vCos=Math.cos(azimuth);vSin=Math.sin(azimuth);
+  radialMenu=null;pendingConn=null;selectedPath=-1;dirty=true;
+}
+
+function setZoom(dir){
+  var oldZ=ZOOMS[zoomIdx];
+  zoomIdx=clamp(zoomIdx+dir,0,ZOOMS.length-1);
+  var newZ=ZOOMS[zoomIdx];if(newZ===oldZ)return;
+  var cx=W/2,cy=H/2;
+  ox=cx+(ox-cx)*newZ/oldZ;oy=cy+(oy-cy)*newZ/oldZ;
+  HW=24*newZ;HH=12*newZ;radialMenu=null;dirty=true;
+}
+
+// ════════════════════════════════════════════
+// PROJECTION (v20 — unchanged)
+// ════════════════════════════════════════════
+
+function g2s(c,r){
+  var dc=c-GCX,dr=r-GCY;
+  var a=dc*vCos-dr*vSin+GCX,b=dc*vSin+dr*vCos+GCY;
+  return[ox+(a-b)*HW,oy+(a+b)*HH];
+}
+function proj(gc,gr,z){
+  var dx=gc-GCX,dy=gr-GCY;
+  var a=dx*vCos-dy*vSin+GCX,b=dx*vSin+dy*vCos+GCY;
+  return[ox+(a-b)*HW,oy+(a+b)*HH-(z||0)*HH];
+}
+function viewDepth(c,r){return(c-GCX)*(vCos+vSin)+(r-GCY)*(vCos-vSin);}
+function clamp(v,lo,hi){return v<lo?lo:v>hi?hi:v}
+
+// boxes[i] = {c0,r0,c1,r1,hue,hs:[...]} — hs holds one height per cell,
+// row-major over the box (9 entries for a 3×3).
+function rebuildMaps(){
+  hmap.fill(0);hueMap.fill(-1);ownerMap.fill(-1);
+  for(var i=0;i<boxes.length;i++){
+    var b=boxes[i],w=b.c1-b.c0+1;
+    for(var r=b.r0;r<=b.r1;r++) for(var c=b.c0;c<=b.c1;c++){
+      var ci=r*GW+c;
+      hmap[ci]=b.hs[(r-b.r0)*w+(c-b.c0)];hueMap[ci]=b.hue;ownerMap[ci]=i;
+    }
+  }
+  dirty=true;
+}
+
+function s2gAt(sx,sy,h){
+  var dx=sx-ox,dy=sy+h*HH-oy;
+  var fa=(dx/HW+dy/HH)/2,fb=(dy/HH-dx/HW)/2;
+  var da=fa-GCX,db=fb-GCY;
+  var c=Math.round(da*vCos+db*vSin+GCX);
+  var r=Math.round(-da*vSin+db*vCos+GCY);
+  if(c<0||c>=GW||r<0||r>=GH) return null;
+  return[c,r];
+}
+function findParent(c,r){return(c<0||c>=GW||r<0||r>=GH)?-1:ownerMap[r*GW+c];}
+
+// ════════════════════════════════════════════
+// AUTO-EXPAND GRID (v20 — unchanged)
+// ════════════════════════════════════════════
+
+function s2gRaw(sx,sy){
+  var dx=sx-ox,dy=sy-oy;
+  var fa=(dx/HW+dy/HH)/2,fb=(dy/HH-dx/HW)/2;
+  var da=fa-GCX,db=fb-GCY;
+  return[Math.round(da*vCos+db*vSin+GCX),Math.round(-da*vSin+db*vCos+GCY)];
+}
+
+function expandTo(c,r){
+  var changed=false;
+  function shiftC(d){
+    for(var i=0;i<boxes.length;i++){boxes[i].c0+=d;boxes[i].c1+=d;}
+    for(var i=0;i<PATHS.length;i++){PATHS[i].a[0]+=d;PATHS[i].b[0]+=d;}
+    if(pendingConn)pendingConn[0]+=d;if(pendingPlace)pendingPlace[0]+=d;
+    if(anim&&anim.kind==='raise')anim.c+=d;
+  }
+  function shiftR(d){
+    for(var i=0;i<boxes.length;i++){boxes[i].r0+=d;boxes[i].r1+=d;}
+    for(var i=0;i<PATHS.length;i++){PATHS[i].a[1]+=d;PATHS[i].b[1]+=d;}
+    if(pendingConn)pendingConn[1]+=d;if(pendingPlace)pendingPlace[1]+=d;
+    if(anim&&anim.kind==='raise')anim.r+=d;
+  }
+  while(c<0&&GW<64){shiftC(1);GW++;c++;changed=true;}
+  while(c>=GW&&GW<64){GW++;changed=true;}
+  while(r<0&&GH<64){shiftR(1);GH++;r++;changed=true;}
+  while(r>=GH&&GH<64){GH++;changed=true;}
+  if(changed){allocGrid();rebuildMaps();rerouteAll();}
+  // At the 64-cell cap the grid stops growing; clamp so a further tap can't
+  // produce out-of-range cells (which wrapped into the wrong hmap row)
+  return[clamp(c,0,GW-1),clamp(r,0,GH-1)];
+}
+
+// ════════════════════════════════════════════
+// FREEWAY A* PATHFINDER
+// ════════════════════════════════════════════
+
+var PDIRS=[{dc:0,dr:-1,e:'S'},{dc:0,dr:1,e:'N'},{dc:1,dr:0,e:'W'},{dc:-1,dr:0,e:'E'}];
+
+// All empty cells touching the perimeter of the parent block that contains
+// (c,r). e = the face of the port cell that touches the block.
+// v2 used only the four neighbours of the tapped cell, so a centre or child
+// tap (always surrounded) had no ports and could never route.
+function blockPorts(pi){
+  var b=boxes[pi],ports=[];
+  for(var rr=b.r0;rr<=b.r1;rr++) for(var cc=b.c0;cc<=b.c1;cc++)
+    for(var d=0;d<4;d++){
+      var nc=cc+PDIRS[d].dc,nr=rr+PDIRS[d].dr;
+      if(nc>=b.c0&&nc<=b.c1&&nr>=b.r0&&nr<=b.r1) continue;   // inside block
+      if(nc<0||nc>=GW||nr<0||nr>=GH||hmap[nr*GW+nc]!==0) continue;
+      ports.push({c:nc,r:nr,e:PDIRS[d].e});
+    }
+  return ports;
+}
+
+// A cell no further freeway piece can enter: a straight, or two pieces already.
+function cellSealed(ci){var l=pathOcc.get(ci);return !!l&&(l.length>=2||!COMP[l[0]]);}
+
+// Flood fill from the source ports over passable cells. Returns a byte map
+// so unreachable destinations are skipped before any A* runs — keeps a
+// walled-off endpoint from costing 24 full-grid searches per reroute.
+function reachFrom(ports){
+  var seen=new Uint8Array(GW*GH),q=[];
+  for(var i=0;i<ports.length;i++){var ci=ports[i].r*GW+ports[i].c;if(!seen[ci]){seen[ci]=1;q.push(ci);}}
+  for(var qi=0;qi<q.length;qi++){
+    var ci=q[qi],c=ci%GW,r=(ci/GW)|0;
+    for(var d=0;d<4;d++){
+      var nc=c+PDIRS[d].dc,nr=r+PDIRS[d].dr;
+      if(nc<0||nc>=GW||nr<0||nr>=GH) continue;
+      var ni=nr*GW+nc;
+      if(seen[ni]||hmap[ni]>0||cellSealed(ni)) continue;
+      seen[ni]=1;q.push(ni);
+    }
+  }
+  return seen;
+}
+
+function aStar(sc,sr,sEin,ec,er,eExit){
+  if(sc<0||sc>=GW||sr<0||sr>=GH||ec<0||ec>=GW||er<0||er>=GH) return null;
+  if(hmap[sr*GW+sc]>0||hmap[er*GW+ec]>0) return null;
+
+  // Same-cell shortcut
+  if(sc===ec&&sr===er){
+    var pk=pkFor(sEin,eExit);
+    if(pk&&pieceFits(sr*GW+sc,pk))
+      return[{c:sc,r:sr,pk:pk,ein:sEin,eout:eExit}];
+    return null;
+  }
+
+  var M=Math.max(GW,GH);
+  var heap=[],hn=0;
+  function hpush(f,s){
+    heap[hn]=[f,s]; var i=hn++;
+    while(i>0){var p=(i-1)>>1;
+      if(heap[p][0]<=heap[i][0])break;
+      var t=heap[p];heap[p]=heap[i];heap[i]=t;i=p;}
+  }
+  function hpop(){
+    var top=heap[0]; hn--;
+    if(hn>0){heap[0]=heap[hn];
+      var i=0;
+      for(;;){var l=2*i+1,r=l+1,m=i;
+        if(l<hn&&heap[l][0]<heap[m][0])m=l;
+        if(r<hn&&heap[r][0]<heap[m][0])m=r;
+        if(m===i)break;
+        var t=heap[m];heap[m]=heap[i];heap[i]=t;i=m;}}
+    return top;
+  }
+
+  var sid=function(c,r,ei){return((r*GW+c)*4)+ei;};
+  var gSc=new Map(), came=new Map();
+  var hEst=function(c,r){return Math.sqrt((c-ec)*(c-ec)+(r-er)*(r-er))*0.7;};
+
+  var s0=sid(sc,sr,EIDX[sEin]);
+  gSc.set(s0,0);
+  hpush(hEst(sc,sr),s0);
+
+  var ITER=0;
+  while(hn>0&&ITER++<40000){
+    var pair=hpop();
+    var cur=pair[1];
+    var ei=cur&3, cell=cur>>2;
+    var c=cell%GW, r=(cell/GW)|0;
+    var ein=ENAM[ei];
+    var g=gSc.get(cur);
+
+    for(var xo=0;xo<4;xo++){
+      var eout=ENAM[xo];
+      if(eout===ein) continue;
+      var pk=pkFor(ein,eout);
+      if(!pieceFits(r*GW+c,pk)) continue;
+
+      // Goal check
+      if(c===ec&&r===er&&eout===eExit){
+        var cells=[{c:c,r:r,pk:pk,ein:ein,eout:eout}];
+        var cu=cur;
+        while(came.has(cu)){
+          var pv=came.get(cu);
+          var pcell=pv>>2;
+          var pc=pcell%GW, pr=(pcell/GW)|0;
+          var pei=ENAM[pv&3];
+          var ceIn=ENAM[cu&3];
+          var peOut=OPP[ceIn];
+          cells.unshift({c:pc,r:pr,pk:pkFor(pei,peOut),ein:pei,eout:peOut});
+          cu=pv;
+        }
+        return cells;
+      }
+
+      var step=STEP[eout];
+      var nc=c+step[0], nr=r+step[1];
+      if(nc<0||nc>=GW||nr<0||nr>=GH) continue;
+      if(hmap[nr*GW+nc]>0) continue;
+      var cost=PIECES[pk].len+(PIECES[pk].len<1?0.05:0);
+      var ng=g+cost;
+      var nid=sid(nc,nr,EIDX[OPP[eout]]);
+      var old=gSc.get(nid);
+      if(old===undefined||ng<old){
+        gSc.set(nid,ng);
+        came.set(nid,cur);
+        hpush(ng+hEst(nc,nr),nid);
+      }
+    }
+  }
+  return null;
+}
+
+function routePath(p){
+  p.cells=null;
+  if(!p.a||!p.b) return;
+  var ac=p.a[0],ar=p.a[1],bc=p.b[0],br=p.b[1];
+  var pa=findParent(ac,ar),pb=findParent(bc,br);
+  if(pa<0||pb<0||pa===pb) return;          // same block (or none) — no route
+
+  var sp=blockPorts(pa),dp=blockPorts(pb);
+  if(!sp.length||!dp.length) return;
+  var reach=reachFrom(sp);
+  dp=dp.filter(function(d){return reach[d.r*GW+d.c];});
+  if(!dp.length) return;
+
+  // Port pairs sorted by port-to-port distance, with a small bias toward the
+  // cells that were actually tapped so "connect from here" still means something
+  function dist(x0,y0,x1,y1){return Math.sqrt((x0-x1)*(x0-x1)+(y0-y1)*(y0-y1));}
+  var pairs=[];
+  for(var si=0;si<sp.length;si++) for(var di=0;di<dp.length;di++){
+    var s=sp[si],d=dp[di];
+    pairs.push({sc:s.c,sr:s.r,sein:s.e,dc:d.c,dr:d.r,dexit:d.e,
+      d:dist(s.c,s.r,d.c,d.r)+0.3*(dist(s.c,s.r,ac,ar)+dist(d.c,d.r,bc,br))});
+  }
+  pairs.sort(function(a,b){return a.d-b.d;});
+
+  for(var i=0;i<Math.min(24,pairs.length);i++){
+    var pr=pairs[i];
+    var cells=aStar(pr.sc,pr.sr,pr.sein,pr.dc,pr.dr,pr.dexit);
+    if(cells){
+      p.cells=cells;
+      // Register occupancy
+      for(var j=0;j<cells.length;j++){
+        var cl=cells[j],ci=cl.r*GW+cl.c;
+        var l=pathOcc.get(ci);
+        if(!l){l=[];pathOcc.set(ci,l);}
+        l.push(cl.pk);
+      }
+      return;
+    }
+  }
+}
+
+function rerouteAll(){
+  pathOcc=new Map();
+  for(var i=0;i<PATHS.length;i++) routePath(PATHS[i]);
+  dirty=true;
+}
+
+// ════════════════════════════════════════════
+// FREEWAY RENDERING
+// ════════════════════════════════════════════
+
+function drawPaths(t){
+  for(var pi=0;pi<PATHS.length;pi++){
+    var p=PATHS[pi];
+    if(!p.cells){
+      // No route — dashed red fallback
+      if(p.a&&p.b&&hmap[p.a[1]*GW+p.a[0]]>0&&hmap[p.b[1]*GW+p.b[0]]>0){
+        var elA=hmap[p.a[1]*GW+p.a[0]],elB=hmap[p.b[1]*GW+p.b[0]];
+        var pa=g2s(p.a[0],p.a[1]),pb=g2s(p.b[0],p.b[1]);
+        X.strokeStyle='rgba(204,0,0,0.4)';
+        X.lineWidth=1.5;X.setLineDash([5,5]);
+        X.beginPath();X.moveTo(pa[0],pa[1]-elA*HH);X.lineTo(pb[0],pb[1]-elB*HH);X.stroke();
+        X.setLineDash([]);
+      }
+      continue;
+    }
+
+    var isSel=!exporting&&selectedPath===pi;
+
+    // Band fill
+    X.fillStyle=isSel?'rgba(26,26,26,0.14)':'rgba(26,26,26,0.07)';
+    X.beginPath();
+    for(var ci=0;ci<p.cells.length;ci++){
+      var cl=p.cells[ci],pc=PIECES[cl.pk];
+      var bx=cl.c-0.5,by=cl.r-0.5;
+      var pts=pc.poly;
+      var q=proj(bx+pts[0][0],by+pts[0][1],0);
+      X.moveTo(q[0],q[1]);
+      for(var k=1;k<pts.length;k++){
+        q=proj(bx+pts[k][0],by+pts[k][1],0);
+        X.lineTo(q[0],q[1]);
+      }
+      X.closePath();
+    }
+    X.fill();
+
+    // Side strokes
+    X.strokeStyle=isSel?'rgba(26,26,26,0.4)':'rgba(26,26,26,0.22)';
+    X.lineWidth=1;
+    X.beginPath();
+    for(var ci=0;ci<p.cells.length;ci++){
+      var cl=p.cells[ci],pc=PIECES[cl.pk];
+      var bx=cl.c-0.5,by=cl.r-0.5;
+      for(var si=0;si<pc.sides.length;si++){
+        var sd=pc.sides[si];
+        var a=proj(bx+sd[0][0],by+sd[0][1],0);
+        var b=proj(bx+sd[1][0],by+sd[1][1],0);
+        X.moveTo(a[0],a[1]);X.lineTo(b[0],b[1]);
+      }
+    }
+    X.stroke();
+
+    // Lane — marching dashes on midline (paused = frozen where it stopped)
+    {
+      var mid=[];
+      var c0=p.cells[0];
+      var em=EMID[c0.ein];
+      mid.push(proj(c0.c-0.5+em[0],c0.r-0.5+em[1],0));
+      for(var ci=0;ci<p.cells.length;ci++){
+        var cl=p.cells[ci];
+        var xm=EMID[cl.eout];
+        mid.push(proj(cl.c-0.5+xm[0],cl.r-0.5+xm[1],0));
+      }
+      var rgb=h2r(p.hue,60,42);
+      X.strokeStyle='rgb('+rgb[0]+','+rgb[1]+','+rgb[2]+')';
+      X.lineWidth=Math.max(2,HH*0.35);
+      X.lineCap='round';
+      var dl=Math.max(6,HW*0.35);
+      X.setLineDash([dl,dl*0.8]);
+      X.lineDashOffset=p.paused?p.pauseOff:-t*DASHV*p.dir;
+      X.beginPath();
+      X.moveTo(mid[0][0],mid[0][1]);
+      for(var k=1;k<mid.length;k++) X.lineTo(mid[k][0],mid[k][1]);
+      X.stroke();
+      X.setLineDash([]);X.lineCap='butt';
+    }
+
+    // Endpoint dots
+    var eA=hmap[p.a[1]*GW+p.a[0]],eB=hmap[p.b[1]*GW+p.b[0]];
+    var hA=hueMap[p.a[1]*GW+p.a[0]],hB=hueMap[p.b[1]*GW+p.b[0]];
+    for(var ei=0;ei<2;ei++){
+      var ec=ei===0?p.a:p.b,eh=ei===0?hA:hB,ee=ei===0?eA:eB;
+      if(eh<0) continue;
+      var rgb2=h2r(eh,65,45);
+      var ep=g2s(ec[0],ec[1]);
+      X.beginPath();X.arc(ep[0],ep[1]-ee*HH,3.5,0,Math.PI*2);
+      X.fillStyle='rgb('+rgb2[0]+','+rgb2[1]+','+rgb2[2]+')';X.fill();
+    }
+  }
+}
+
+// Path marker (midpoint on midline, avoiding blocks)
+function pathMarker(p){
+  if(!p.cells||!p.cells.length) return null;
+  var mi=Math.floor(p.cells.length/2);
+  var cl=p.cells[mi];
+  return proj(cl.c,cl.r,0);
+}
+
+function hitPathMarker(sx,sy){
+  for(var i=0;i<PATHS.length;i++){
+    var mp=pathMarker(PATHS[i]);
+    if(!mp) continue;
+    var dx=sx-mp[0],dy=sy-mp[1];
+    if(dx*dx+dy*dy<=22*22) return i;
+  }
+  return -1;
+}
+
+function drawPathMarkers(t){
+  for(var i=0;i<PATHS.length;i++){
+    var mp=pathMarker(PATHS[i]);
+    if(!mp) continue;
+    var isSel=selectedPath===i,rad=isSel?10:6;
+    var rgb=h2r(PATHS[i].hue,65,45);
+    X.beginPath();X.arc(mp[0],mp[1],rad,0,Math.PI*2);
+    X.fillStyle='rgb('+rgb[0]+','+rgb[1]+','+rgb[2]+')';X.fill();
+    X.strokeStyle='rgba(255,255,255,0.8)';X.lineWidth=1.5;X.stroke();
+    if(isSel){
+      var pulse=0.5+0.4*Math.sin(t*0.006);
+      X.beginPath();X.arc(mp[0],mp[1],15,0,Math.PI*2);
+      X.strokeStyle='rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+','+pulse.toFixed(2)+')';
+      X.lineWidth=2;X.stroke();
+    }
+  }
+}
+
+// ════════════════════════════════════════════
+// HIT DETECTION (ported from DREADNOUGHT 04 R2)
+// ════════════════════════════════════════════
+// Walk the cached prism list in reverse painter's order (front to back) and
+// test the pointer against each prism's top face, then its visible side
+// faces. First containment wins. If nothing contains the point the pixel is
+// uncovered paper, so the ground-plane inverse is the visible cell.
+
+var SIDES=[{v:[1,0,4,5],nx:0,ny:-1},{v:[2,1,5,6],nx:1,ny:0},{v:[3,2,6,7],nx:0,ny:1},{v:[0,3,7,4],nx:-1,ny:0}];
+var CORN=[[-0.5,-0.5],[0.5,-0.5],[0.5,0.5],[-0.5,0.5]];   // base corner offsets, index = point index 0..3
+
+function prismPts(c,r,h){
+  var hw=0.5;
+  return[proj(c-hw,r-hw,0),proj(c+hw,r-hw,0),proj(c+hw,r+hw,0),proj(c-hw,r+hw,0),
+         proj(c-hw,r-hw,h),proj(c+hw,r-hw,h),proj(c+hw,r+hw,h),proj(c-hw,r+hw,h)];
+}
+function pip(px,py,pts){
+  var inside=false;
+  for(var i=0,j=pts.length-1;i<pts.length;j=i++){
+    var xi=pts[i][0],yi=pts[i][1],xj=pts[j][0],yj=pts[j][1];
+    if(((yi>py)!==(yj>py))&&(px<(xj-xi)*(py-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+// → {c,r,face:'top'|'side'|'ground'} or null when off-grid
+function pick(sx,sy){
+  if(dirty) rebuildCache();
+  var gx=vCos+vSin,gy=vCos-vSin;
+  for(var i=prismList.length-1;i>=0;i--){
+    var d=prismList[i],p=prismPts(d.c,d.r,d.h);
+    if(pip(sx,sy,[p[4],p[5],p[6],p[7]])) return{c:d.c,r:d.r,face:'top'};
+    for(var k=0;k<4;k++){
+      var sd=SIDES[k];if(sd.nx*gx+sd.ny*gy<0) continue;   // back faces
+      var v=sd.v;
+      if(pip(sx,sy,[p[v[0]],p[v[1]],p[v[2]],p[v[3]]])) return{c:d.c,r:d.r,face:'side'};
+    }
+  }
+  var g=s2gAt(sx,sy,0);
+  return g?{c:g[0],r:g[1],face:'ground'}:null;
+}
+
+// ════════════════════════════════════════════
+// ACTIONS
+// ════════════════════════════════════════════
+
+function deleteAt(c,r){
+  var bi=findParent(c,r);if(bi<0)return;
+  boxes.splice(bi,1);anim=null;pendingConn=null;
+  rebuildMaps();
+  // Remove paths referencing the deleted block
+  PATHS=PATHS.filter(function(p){return hmap[p.a[1]*GW+p.a[0]]>0&&hmap[p.b[1]*GW+p.b[0]]>0;});
+  rerouteAll();selectedPath=-1;
+}
+
+function recolorAt(c,r){
+  var bi=findParent(c,r);if(bi<0)return;
+  boxes[bi].hue=hueCounter;hueCounter=(hueCounter+GA)%360;
+  rebuildMaps();
+}
+
+// Raise (d=+1) or lower (d=-1) the tapped cell of its block, 1..MAXH.
+// With RAISE_WHOLE_BLOCK the whole group moves together.
+function raiseAt(c,r,d){
+  var bi=findParent(c,r);if(bi<0)return false;
+  var b=boxes[bi],w=b.c1-b.c0+1,k=(r-b.r0)*w+(c-b.c0);
+  var from=b.hs[k],to=clamp(from+d,1,MAXH);
+  if(to===from)return false;
+  if(RAISE_WHOLE_BLOCK){for(var i=0;i<b.hs.length;i++)b.hs[i]=clamp(b.hs[i]+d,1,MAXH);}
+  else b.hs[k]=to;
+  rebuildMaps();
+  anim={kind:'raise',c:c,r:r,from:from,to:to,t0:performance.now()};
+  return true;
+}
+
+function rectFree(c0,r0,c1,r1){
+  for(var r=r0;r<=r1;r++) for(var c=c0;c<=c1;c++){
+    if(c<0||c>=GW||r<0||r>=GH||hmap[r*GW+c]>0) return false;
+  }
+  return true;
+}
+// Preview check for an armed footprint: in-grid cells must be empty;
+// off-grid cells will be created by expansion.
+function footprintFree(c,r){
+  for(var rr=r-1;rr<=r+1;rr++) for(var cc=c-1;cc<=c+1;cc++){
+    if(cc<0||cc>=GW||rr<0||rr>=GH) continue;
+    if(hmap[rr*GW+cc]>0) return false;
+  }
+  return true;
+}
+
+// Place a 3×3 block centred on (c,r), growing the grid if the footprint
+// falls outside it. Returns false at the 64-cell cap or on overlap.
+function placeBlock(c,r){
+  var lo=expandTo(c-1,r-1);                 // may shift everything left/up
+  var c0=lo[0],r0=lo[1],hi=expandTo(c0+2,r0+2);
+  var c1=hi[0],r1=hi[1];
+  if(c1-c0!==2||r1-r0!==2||!rectFree(c0,r0,c1,r1)) return false;
+  var hue=hueCounter;hueCounter=(hueCounter+GA)%360;
+  boxes.push({c0:c0,r0:r0,c1:c1,r1:r1,hue:hue,hs:[1,1,1,1,1,1,1,1,1]});
+  rebuildMaps();rerouteAll();
+  anim={kind:'place',bi:boxes.length-1,t0:performance.now()};
+  return true;
+}
+
+// ════════════════════════════════════════════
+// DRAWING — PRISMS & GRID (v20)
+// ════════════════════════════════════════════
+
+function prism(c,r,h,R,G2,B){
+  var hw=0.5,p=[
+    proj(c-hw,r-hw,0),proj(c+hw,r-hw,0),proj(c+hw,r+hw,0),proj(c-hw,r+hw,0),
+    proj(c-hw,r-hw,h),proj(c+hw,r-hw,h),proj(c+hw,r+hw,h),proj(c-hw,r+hw,h)
+  ];
+  var gx=vCos+vSin,gy=vCos-vSin;
+  var cs=proj(c,r,0),vis=[];
+  for(var i=0;i<4;i++){
+    var s=SIDES[i],dot=s.nx*gx+s.ny*gy;
+    if(dot>=0){
+      var vi=s.v,v0=p[vi[0]],v1=p[vi[1]],v2=p[vi[2]],v3=p[vi[3]];
+      var avgX=(v0[0]+v1[0]+v2[0]+v3[0])/4;
+      var avgY=(v0[1]+v1[1]+v2[1]+v3[1])/4;
+      var dx=avgX-cs[0];
+      var m=0.6+0.1*Math.max(-1,Math.min(1,dx/(HW*0.5)));
+      vis.push({p:[v0,v1,v2,v3],m:m,d:avgY,v:vi});
+    }
+  }
+  vis.sort(function(a,b){return a.d-b.d;});
+  for(var i=0;i<vis.length;i++){
+    var f=vis[i],pts=f.p,m=f.m;
+    X.beginPath();X.moveTo(pts[0][0],pts[0][1]);X.lineTo(pts[1][0],pts[1][1]);
+    X.lineTo(pts[2][0],pts[2][1]);X.lineTo(pts[3][0],pts[3][1]);X.closePath();
+    X.fillStyle='rgb('+~~(R*m)+','+~~(G2*m)+','+~~(B*m)+')';X.fill();
+    X.strokeStyle='rgba(0,0,0,.12)';X.lineWidth=1;X.stroke();
+  }
+  // Level seams on the visible sides so the block-level count reads at a glance
+  if(h>1.5){
+    X.strokeStyle='rgba(245,245,240,.35)';X.lineWidth=1;X.beginPath();
+    for(var k=1;k<=h-0.5;k++) for(var i=0;i<vis.length;i++){
+      var v=vis[i].v,a0=CORN[v[0]],a1=CORN[v[1]];
+      var s0=proj(c+a0[0],r+a0[1],k),s1=proj(c+a1[0],r+a1[1],k);
+      X.moveTo(s0[0],s0[1]);X.lineTo(s1[0],s1[1]);
+    }
+    X.stroke();
+  }
+  X.beginPath();X.moveTo(p[4][0],p[4][1]);X.lineTo(p[5][0],p[5][1]);
+  X.lineTo(p[6][0],p[6][1]);X.lineTo(p[7][0],p[7][1]);X.closePath();
+  X.fillStyle='rgb('+R+','+G2+','+B+')';X.fill();
+  X.strokeStyle='rgba(0,0,0,.12)';X.lineWidth=1;X.stroke();
+}
+
+function dia(c,r,fill,stroke,ev){
+  var z=ev||0,hw=0.5;
+  var p0=proj(c-hw,r-hw,z),p1=proj(c+hw,r-hw,z),p2=proj(c+hw,r+hw,z),p3=proj(c-hw,r+hw,z);
+  X.beginPath();X.moveTo(p0[0],p0[1]);X.lineTo(p1[0],p1[1]);X.lineTo(p2[0],p2[1]);X.lineTo(p3[0],p3[1]);X.closePath();
+  if(fill){X.fillStyle=fill;X.fill();}
+  if(stroke){X.strokeStyle=stroke;X.lineWidth=1;X.stroke();}
+}
+
+// ════════════════════════════════════════════
+// RADIAL MENU (v20 adapted for paths)
+// ════════════════════════════════════════════
+
+var ROPTS_BLOCK=[
+  {a:Math.PI/3,label:'DELETE',glyph:'draw_x',act:'blk_delete',live:true},
+  {a:Math.PI/2,label:'WIRE',glyph:'draw_wire',act:'blk_wire',live:true},
+  {a:2*Math.PI/3,label:'COLOR',glyph:'draw_dia',act:'blk_color',live:true},
+  {a:5*Math.PI/6,label:'LABEL',glyph:'draw_a',act:'blk_label',live:false},
+  {a:-Math.PI/3,label:'COPY',glyph:'draw_plus',act:'blk_copy',live:false},
+  {a:-Math.PI/6,label:'LOWER',glyph:'draw_down',act:'blk_lower',live:true}
+];
+var ROPTS_PATH=[
+  {a:Math.PI/3,label:'DELETE',glyph:'draw_x',act:'pth_delete',live:true},
+  {a:Math.PI/2,label:'REVERSE',glyph:'draw_rev',act:'pth_reverse',live:true},
+  {a:2*Math.PI/3,label:'PAUSE',glyph:'draw_style',act:'pth_pause',live:true}
+];
+
+// Radial glyphs (v20)
+function glyphX(x,y,col){X.strokeStyle=col;X.lineWidth=2.5;X.lineCap='round';X.beginPath();X.moveTo(x-6,y-6);X.lineTo(x+6,y+6);X.moveTo(x+6,y-6);X.lineTo(x-6,y+6);X.stroke();X.lineCap='butt';}
+function glyphWire(x,y,col){X.fillStyle=col;X.beginPath();X.arc(x-8,y,3,0,Math.PI*2);X.fill();X.beginPath();X.arc(x+8,y,3,0,Math.PI*2);X.fill();X.strokeStyle=col;X.lineWidth=1.5;X.setLineDash([3,3]);X.beginPath();X.moveTo(x-5,y);X.lineTo(x+5,y);X.stroke();X.setLineDash([]);}
+function glyphDia(x,y,col){X.fillStyle=col;X.beginPath();X.moveTo(x,y-9);X.lineTo(x+7,y);X.lineTo(x,y+9);X.lineTo(x-7,y);X.closePath();X.fill();}
+function glyphA(x,y,col){X.fillStyle=col;X.font='bold 16px -apple-system,BlinkMacSystemFont,sans-serif';X.textAlign='center';X.textBaseline='middle';X.fillText('A',x,y);}
+function glyphPlus(x,y,col){X.strokeStyle=col;X.lineWidth=2.5;X.lineCap='round';X.beginPath();X.moveTo(x,y-7);X.lineTo(x,y+7);X.moveTo(x-7,y);X.lineTo(x+7,y);X.stroke();X.lineCap='butt';}
+function glyphRev(x,y,col){X.strokeStyle=col;X.lineWidth=2;X.lineCap='round';X.beginPath();X.moveTo(x-2,y-6);X.lineTo(x-8,y);X.lineTo(x-2,y+6);X.stroke();X.beginPath();X.moveTo(x+2,y-6);X.lineTo(x+8,y);X.lineTo(x+2,y+6);X.stroke();X.lineCap='butt';}
+function glyphStyle(x,y,col){X.strokeStyle=col;X.lineWidth=2;X.lineCap='round';X.beginPath();X.moveTo(x-6,y);X.lineTo(x+6,y);X.stroke();X.lineCap='butt';}
+function glyphDown(x,y,col){X.strokeStyle=col;X.lineWidth=2.5;X.lineCap='round';X.beginPath();X.moveTo(x-7,y-3);X.lineTo(x,y+4);X.lineTo(x+7,y-3);X.stroke();X.lineCap='butt';}
+var GFN={draw_x:glyphX,draw_wire:glyphWire,draw_dia:glyphDia,draw_a:glyphA,draw_plus:glyphPlus,draw_rev:glyphRev,draw_style:glyphStyle,draw_down:glyphDown};
+
+function radialOpts(){return radialMenu.type==='block'?ROPTS_BLOCK:ROPTS_PATH;}
+function radialNodePos(i){var o=radialOpts()[i];return[radialMenu.sx+Math.cos(o.a)*RRAD,radialMenu.sy+Math.sin(o.a)*RRAD];}
+function hitRadial(sx,sy){if(!radialMenu)return-1;var opts=radialOpts();for(var i=0;i<opts.length;i++){var p=radialNodePos(i),dx=sx-p[0],dy=sy-p[1];if(dx*dx+dy*dy<=RNOD*RNOD)return i;}return-1;}
+
+function execRadial(idx){
+  var rm=radialMenu,o=radialOpts()[idx];if(!o.live){radialMenu=null;return;}
+  if(o.act==='blk_delete')deleteAt(rm.c,rm.r);
+  else if(o.act==='blk_wire')pendingConn=[rm.c,rm.r];
+  else if(o.act==='blk_color')recolorAt(rm.c,rm.r);
+  else if(o.act==='blk_lower')raiseAt(rm.c,rm.r,-1);
+  else if(o.act==='pth_delete'){PATHS.splice(rm.idx,1);selectedPath=-1;rerouteAll();}
+  else if(o.act==='pth_reverse'){var p=PATHS[rm.idx],tmp=p.a;p.a=p.b;p.b=tmp;p.dir=-p.dir;if(p.paused)p.pauseOff=-p.pauseOff;rerouteAll();}
+  else if(o.act==='pth_pause'){var p=PATHS[rm.idx];p.paused=!p.paused;if(p.paused)p.pauseOff=-performance.now()*DASHV*p.dir;}
+  radialMenu=null;
+}
+
+function drawRadial(t){
+  if(!radialMenu)return;if(t-radialMenu.t0>3000){radialMenu=null;return;}
+  var opts=radialOpts(),cx=radialMenu.sx,cy=radialMenu.sy;
+  X.strokeStyle='rgba(0,0,0,.08)';X.lineWidth=1;
+  for(var i=0;i<opts.length;i++){var p=radialNodePos(i);X.beginPath();X.moveTo(cx,cy);X.lineTo(p[0],p[1]);X.stroke();}
+  for(var i=0;i<opts.length;i++){
+    var o=opts[i],p=radialNodePos(i),nx=p[0],ny=p[1];
+    var isDel=o.act.indexOf('delete')>=0,dim=!o.live;
+    X.beginPath();X.arc(nx,ny,RNOD,0,Math.PI*2);
+    X.fillStyle=isDel?'#FFF0F0':dim?'#EDEDEA':'#E8E8E4';X.fill();
+    X.strokeStyle=isDel?'#CC0000':dim?'#BBBBBB':'#1A1A1A';X.lineWidth=1.5;X.stroke();
+    GFN[o.glyph](nx,ny,isDel?'#CC0000':dim?'#AAAAAA':'#1A1A1A');
+    X.fillStyle=isDel?'#CC0000':dim?'#AAAAAA':'#555555';
+    X.font='14px -apple-system,BlinkMacSystemFont,sans-serif';X.textAlign='center';X.textBaseline='top';
+    X.fillText(o.label,nx,ny+RNOD+5);
+  }
+}
+
+// ════════════════════════════════════════════
+// DEMO
+// ════════════════════════════════════════════
+
+function initDemo(){
+  hueCounter=0;
+  // Four 3×3 blocks, centre cell one level up (the old parent+child look)
+  function addB(c0,r0){var hue=hueCounter;hueCounter=(hueCounter+GA)%360;boxes.push({c0:c0,r0:r0,c1:c0+2,r1:r0+2,hue:hue,hs:[1,1,1,1,2,1,1,1,1]});}
+  addB(1,1);addB(7,1);addB(1,7);addB(7,7);
+  rebuildMaps();
+  // Demo paths
+  var mh1=hueCounter;hueCounter=(hueCounter+GA)%360;
+  var mh2=hueCounter;hueCounter=(hueCounter+GA)%360;
+  PATHS.push({a:[3,2],b:[7,2],dir:1,hue:mh1,cells:null});
+  PATHS.push({a:[2,3],b:[2,7],dir:1,hue:mh2,cells:null});
+  rerouteAll();
+}
+
+// ════════════════════════════════════════════
+// MAIN DRAW
+// ════════════════════════════════════════════
+
+// Rebuilt only when blocks, grid size, view (pan/zoom/rotate) or paths change.
+// v2 rebuilt and depth-sorted every cell every frame — 13× the cost at 64×64.
+function rebuildCache(){
+  // Empty grid: flat diamonds never overlap, so no depth sort; one path, one stroke.
+  // (v2 stroked each cell separately so shared edges were painted twice —
+  //  alpha raised from .06 to .11 to keep the same weight.)
+  // Built with the pan offset removed and translated at draw time, so panning
+  // never triggers a rebuild — only blocks, grid size, zoom and rotation do.
+  var sox=ox,soy=oy;ox=0;oy=0;
+  gridPath=new Path2D();
+  for(var r=0;r<GH;r++) for(var c=0;c<GW;c++){
+    if(hmap[r*GW+c]) continue;
+    var p0=proj(c-0.5,r-0.5,0),p1=proj(c+0.5,r-0.5,0),p2=proj(c+0.5,r+0.5,0),p3=proj(c-0.5,r+0.5,0);
+    gridPath.moveTo(p0[0],p0[1]);gridPath.lineTo(p1[0],p1[1]);gridPath.lineTo(p2[0],p2[1]);gridPath.lineTo(p3[0],p3[1]);gridPath.closePath();
+  }
+  ox=sox;oy=soy;
+  // Occupied cells, depth-sorted once, rgb precomputed
+  // Lightness climbs gently with height (45 → 59 over 8 levels); seams do the counting.
+  prismList=[];
+  for(var r=0;r<GH;r++) for(var c=0;c<GW;c++){
+    var h=hmap[r*GW+c];if(!h) continue;
+    var rgb=h2r(hueMap[r*GW+c],65,45+Math.min(h-1,7)*2);
+    prismList.push({c:c,r:r,h:h,bi:ownerMap[r*GW+c],d:viewDepth(c,r),R:rgb[0],G:rgb[1],B:rgb[2]});
+  }
+  prismList.sort(function(a,b){return a.d-b.d;});
+  dirty=false;
+}
+
+function easeBack(u){var s=1.70158,p=u-1;return 1+(s+1)*p*p*p+s*p*p;}
+
+function draw(overrideT){
+  var t=overrideT!==undefined?overrideT:performance.now();
+  if(dirty) rebuildCache();
+  if(anim&&!exporting&&t-anim.t0>=PM) anim=null;
+  X.fillStyle='#F5F5F0';X.fillRect(0,0,W,H);
+
+  // Empty grid cells (cached)
+  X.strokeStyle='rgba(0,0,0,.11)';X.lineWidth=1;X.save();X.translate(ox,oy);X.stroke(gridPath);X.restore();
+
+  // Freeway bands (ground level, under blocks)
+  drawPaths(t);
+
+  // Occupied cells as prisms (cached depth order). Animating cells are
+  // committed to the maps already and just drawn at an interpolated height
+  // in their own depth slot: place = pop from 0 with overshoot, raise = back-ease.
+  var a=(!exporting&&anim)?anim:null,sc=1,hr=0;
+  if(a){var f=Math.min(1,(t-a.t0)/PM);sc=f<=0.6?f/0.6*1.2:1.2-0.2*(f-0.6)/0.4;if(a.kind==='raise')hr=a.from+(a.to-a.from)*easeBack(f);}
+  for(var i=0;i<prismList.length;i++){
+    var d=prismList[i],h=d.h;
+    if(a){if(a.kind==='place'){if(d.bi===a.bi)h=d.h*sc;}else if(d.c===a.c&&d.r===a.r)h=hr;}
+    prism(d.c,d.r,h,d.R,d.G,d.B);
+  }
+
+  if(!exporting){
+    drawPathMarkers(t);
+    var pulse=0.5+0.4*Math.sin(t*0.006);
+
+    // Armed block pulse (first tap on a block)
+    if(pendingConn&&!radialMenu){
+      var ph=hueMap[pendingConn[1]*GW+pendingConn[0]],prgb=h2r(ph,80,60);
+      var elev=hmap[pendingConn[1]*GW+pendingConn[0]];
+      var pc=pendingConn[0],pr=pendingConn[1],hw=0.5;
+      var d0=proj(pc-hw,pr-hw,elev),d1=proj(pc+hw,pr-hw,elev),d2=proj(pc+hw,pr+hw,elev),d3=proj(pc-hw,pr+hw,elev);
+      X.beginPath();X.moveTo(d0[0],d0[1]);X.lineTo(d1[0],d1[1]);X.lineTo(d2[0],d2[1]);X.lineTo(d3[0],d3[1]);X.closePath();
+      X.strokeStyle='rgba('+prgb[0]+','+prgb[1]+','+prgb[2]+','+pulse.toFixed(2)+')';X.lineWidth=3;X.stroke();
+    }
+
+    // Armed footprint (first tap on open grid): the 3×3 that a second tap places
+    if(pendingPlace&&!radialMenu){
+      var fc=pendingPlace[0],fr=pendingPlace[1];
+      var frgb=footprintFree(fc,fr)?h2r(hueCounter,65,45):[204,0,0];
+      var fill='rgba('+frgb[0]+','+frgb[1]+','+frgb[2]+',0.25)';
+      var str='rgba('+frgb[0]+','+frgb[1]+','+frgb[2]+','+pulse.toFixed(2)+')';
+      for(var r=fr-1;r<=fr+1;r++) for(var c=fc-1;c<=fc+1;c++) dia(c,r,fill,str,0);
+    }
+
+    drawRadial(t);
+  }
+}
+
+function loop(){draw();requestAnimationFrame(loop);}
+
+// ════════════════════════════════════════════
+// INPUT — pan by default, faces by hit detection
+// ════════════════════════════════════════════
+
+// One pointer at a time, captured. Press → pick what's under the finger.
+// Move past CLICK_TOL → it's a drag: pans if the press was on ground or off
+// grid; a drag from a block face is reserved and does nothing. Release
+// without moving → it's a tap, resolved by tap().
+C.addEventListener('pointerdown',function(e){
+  e.preventDefault();
+  if(activeId!==null&&e.pointerId!==activeId&&(isDown||isPanning||isOrbiting))return;
+  activeId=e.pointerId;
+  try{C.setPointerCapture(e.pointerId);}catch(_){}
+  if(e.button===1){isOrbiting=true;orbitSX=e.clientX;orbitAz=azimuth;return;}
+  if(radialMenu){var ri=hitRadial(e.clientX,e.clientY);if(ri>=0)execRadial(ri);else radialMenu=null;return;}
+  isDown=true;moved=false;downPt=[e.clientX,e.clientY];
+  downPick=pick(e.clientX,e.clientY);
+});
+C.addEventListener('pointermove',function(e){
+  if(e.pointerId!==activeId)return;
+  if(isOrbiting){
+    var dx=e.clientX-orbitSX,step=Math.PI/32;
+    var raw=orbitAz+dx*step/10;
+    var az=((Math.round(raw/step)*step)%(Math.PI*2)+Math.PI*2)%(Math.PI*2);
+    if(az!==azimuth){azimuth=az;vCos=Math.cos(azimuth);vSin=Math.sin(azimuth);dirty=true;}
+    radialMenu=null;pendingConn=null;pendingPlace=null;selectedPath=-1;
+    return;
+  }
+  if(isPanning){ox=panOX+(e.clientX-panSX);oy=panOY+(e.clientY-panSY);return;}
+  if(!isDown||moved)return;
+  var mx=e.clientX-downPt[0],my=e.clientY-downPt[1];
+  if(mx*mx+my*my<CLICK_TOL*CLICK_TOL)return;
+  moved=true;
+  if(!downPick||downPick.face==='ground'){
+    isDown=false;isPanning=true;panSX=downPt[0];panSY=downPt[1];panOX=ox;panOY=oy;
+    ox=panOX+mx;oy=panOY+my;
+  }
+  // else: drag began on a block face — reserved, no-op
+});
+C.addEventListener('pointerup',function(e){
+  if(e.pointerId!==activeId)return;
+  activeId=null;
+  if(isOrbiting){isOrbiting=false;return;}
+  if(isPanning){isPanning=false;return;}
+  if(!isDown)return;isDown=false;
+  if(!moved) tap(e.clientX,e.clientY);
+  downPick=null;
+});
+C.addEventListener('pointercancel',function(e){if(e.pointerId!==activeId)return;activeId=null;isOrbiting=false;isPanning=false;isDown=false;moved=false;downPick=null;pendingConn=null;pendingPlace=null;radialMenu=null;selectedPath=-1;});
+C.addEventListener('wheel',function(e){e.preventDefault();setZoom(e.deltaY<0?1:-1);},{passive:false});
+addEventListener('keydown',function(e){
+  if(e.key==='q'||e.key==='Q')rotateView(-1);
+  if(e.key==='e'||e.key==='E')rotateView(1);
+  if(e.key==='='||e.key==='+')setZoom(1);
+  if(e.key==='-'||e.key==='_')setZoom(-1);
+  if(e.key==='r'||e.key==='R')updateView();
+});
+
+// A tap is the whole vocabulary now. Two-tap flows: the first tap arms
+// (pulsing outline), the second decides.
+function tap(sx,sy){
+  // Path markers: tap selects, tap again opens the path radial
+  var mi=hitPathMarker(sx,sy);
+  if(mi>=0){
+    if(selectedPath===mi){var mp=pathMarker(PATHS[mi]);radialMenu={type:'path',idx:mi,sx:mp[0],sy:mp[1],t0:performance.now()};selectedPath=-1;}
+    else selectedPath=mi;
+    pendingConn=null;pendingPlace=null;return;
+  }
+  selectedPath=-1;
+  var pk=downPick||pick(sx,sy);          // what was under the finger at press time
+
+  if(pk&&pk.face!=='ground'){
+    pendingPlace=null;
+    var bi=findParent(pk.c,pk.r);
+    if(pendingConn&&findParent(pendingConn[0],pendingConn[1])===bi){
+      // Second tap on the armed block — the face decides
+      if(pk.face==='top'){raiseAt(pk.c,pk.r,1);pendingConn=[pk.c,pk.r];}   // stays armed: keep tapping to keep raising
+      else{
+        var elev=hmap[pk.r*GW+pk.c],sp=g2s(pk.c,pk.r);
+        radialMenu={type:'block',c:pk.c,r:pk.r,sx:sp[0],sy:sp[1]-elev*HH,t0:performance.now()};
+        pendingConn=null;
+      }
+    } else if(pendingConn){
+      // A different block: complete the freeway armed → here
+      var mh=hueCounter;hueCounter=(hueCounter+GA)%360;
+      PATHS.push({a:[pendingConn[0],pendingConn[1]],b:[pk.c,pk.r],dir:1,hue:mh,cells:null});
+      rerouteAll();pendingConn=null;
+    } else pendingConn=[pk.c,pk.r];       // first tap: arm this block
+    return;
+  }
+
+  // Ground or off-grid: arm a 3×3 footprint, or place it on the second tap
+  pendingConn=null;
+  var g=pk?[pk.c,pk.r]:s2gRaw(sx,sy);
+  if(!pk&&(g[0]<-2||g[0]>GW+1||g[1]<-2||g[1]>GH+1)){pendingPlace=null;return;}   // far off grid: tap away
+  if(pendingPlace&&pendingPlace[0]===g[0]&&pendingPlace[1]===g[1]){if(placeBlock(g[0],g[1]))pendingPlace=null;}
+  else pendingPlace=g;
+}
+
+// ════════════════════════════════════════════
+// GIF EXPORT (v20 — unchanged)
+// ════════════════════════════════════════════
+
+var BAYER16=[0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5];
+function clamp255(v){return v<0?0:v>255?255:v|0;}
+function gifBuildPalette(frames,step){var counts=new Uint32Array(32768);for(var f=0;f<frames.length;f++){var d=frames[f].data,len=d.length;for(var i=0;i<len;i+=step*4){counts[(d[i]>>3)<<10|(d[i+1]>>3)<<5|(d[i+2]>>3)]++;}}var entries=[];for(var k=0;k<32768;k++)if(counts[k])entries.push([k,counts[k]]);entries.sort(function(a,b){return b[1]-a[1];});var pal=new Uint8Array(768),n=Math.min(256,entries.length);for(var i=0;i<n;i++){var key=entries[i][0];pal[i*3]=((key>>10)&31)<<3;pal[i*3+1]=((key>>5)&31)<<3;pal[i*3+2]=(key&31)<<3;}return pal;}
+function gifBuildColorMap(pal){var map=new Uint8Array(32768);for(var key=0;key<32768;key++){var r=((key>>10)&31)<<3,g=((key>>5)&31)<<3,b=(key&31)<<3;var best=0,bestD=1e9;for(var i=0;i<256;i++){var dr=r-pal[i*3],dg=g-pal[i*3+1],db=b-pal[i*3+2];var dist=dr*dr+dg*dg+db*db;if(dist<bestD){bestD=dist;best=i;if(dist===0)break;}}map[key]=best;}return map;}
+function gifIndexFrame(imgData,colorMap,dither){var d=imgData.data,w=imgData.width,len=d.length/4,out=new Uint8Array(len);if(!dither){for(var i=0,j=0;i<len;i++,j+=4)out[i]=colorMap[(d[j]>>3)<<10|(d[j+1]>>3)<<5|(d[j+2]>>3)];}else{for(var i=0,j=0;i<len;i++,j+=4){var x=i%w,y=(i/w)|0,t=(BAYER16[(y&3)*4+(x&3)]/16-0.5)*8;out[i]=colorMap[(clamp255(d[j]+t)>>3)<<10|(clamp255(d[j+1]+t)>>3)<<5|(clamp255(d[j+2]+t)>>3)];}}return out;}
+// LZW: prefix table is a flat Int32Array (prefix<<8|pixel), reused across frames;
+// output grows in a Uint8Array. v2 used a plain object + number array per frame.
+var LZWT=new Int32Array(1<<20);
+function gifLZW(pixels,minCodeSize){var clearCode=1<<minCodeSize,eoiCode=clearCode+1,codeSize=minCodeSize+1,nextCode=eoiCode+1;var out=new Uint8Array(Math.max(4096,pixels.length>>2)),n=0,bufVal=0,bufBits=0;function put(b){if(n===out.length){var nb=new Uint8Array(out.length*2);nb.set(out);out=nb;}out[n++]=b;}function emit(code){bufVal|=code<<bufBits;bufBits+=codeSize;while(bufBits>=8){put(bufVal&0xFF);bufVal>>=8;bufBits-=8;}}LZWT.fill(-1);emit(clearCode);var cur=pixels[0];for(var i=1;i<pixels.length;i++){var key=(cur<<8)|pixels[i];if(LZWT[key]!==-1){cur=LZWT[key];}else{emit(cur);if(nextCode<4096){LZWT[key]=nextCode;if(nextCode>=(1<<codeSize)&&codeSize<12)codeSize++;nextCode++;}else{emit(clearCode);LZWT.fill(-1);codeSize=minCodeSize+1;nextCode=eoiCode+1;}cur=pixels[i];}}emit(cur);emit(eoiCode);if(bufBits>0)put(bufVal&0xFF);return out.subarray(0,n);}
+// Assemble straight into one preallocated Uint8Array (v2 built a JS number array first).
+function gifAssemble(w,h,pal,lzwFrames,delayCs){var total=13+768+19+1;for(var f=0;f<lzwFrames.length;f++){var L=lzwFrames[f].length;total+=8+10+1+L+Math.ceil(L/255)+1;}var out=new Uint8Array(total),n=0;function put(b){out[n++]=b;}function w16(v){put(v&0xFF);put((v>>8)&0xFF);}function wStr(s){for(var i=0;i<s.length;i++)put(s.charCodeAt(i));}wStr('GIF89a');w16(w);w16(h);put(0xF7);put(0);put(0);out.set(pal,n);n+=768;put(0x21);put(0xFF);put(0x0B);wStr('NETSCAPE2.0');put(0x03);put(0x01);put(0x00);put(0x00);put(0x00);for(var f=0;f<lzwFrames.length;f++){put(0x21);put(0xF9);put(0x04);put(0x04);w16(delayCs);put(0x00);put(0x00);put(0x2C);w16(0);w16(0);w16(w);w16(h);put(0x00);put(0x08);var d=lzwFrames[f];for(var i=0;i<d.length;){var sz=Math.min(255,d.length-i);put(sz);out.set(d.subarray(i,i+sz),n);n+=sz;i+=sz;}put(0);}put(0x3B);return out;}
+
+// Streams one frame at a time through an offscreen canvas. v2 captured all
+// frames as raw ImageData first (60 × viewport ≈ 90 MB on a phone, ~500 MB
+// on a 1080p desktop window). The lane dash speed is retuned for the export
+// so the offset travels a whole number of dash periods per loop — v2's fixed
+// speed gave 2.38 / 3.17 periods, a visible jump at every loop seam.
+function exportGIF(hd){
+  var nf=hd?60:30,dur=hd?1200:900,del=hd?2:3,dith=!!hd,samp=hd?4:8;
+  var btn=document.getElementById(hd?'hdbtn':'gifbtn'),other=document.getElementById(hd?'gifbtn':'hdbtn');
+  btn.disabled=true;other.disabled=true;btn.textContent='···';
+  var EW=W,EH=H;
+  var EC=document.createElement('canvas');EC.width=EW;EC.height=EH;
+  var EX=EC.getContext('2d',{willReadFrequently:true});
+  var dl=Math.max(6,HW*0.35),period=dl*1.8,N=Math.max(1,Math.round(0.04*dur/period));
+  var liveV=DASHV;
+  function frame(t){
+    var sv=X,sw=W,sh=H;X=EX;W=EW;H=EH;DASHV=N*period/dur;exporting=true;
+    draw(t);
+    exporting=false;X=sv;W=sw;H=sh;DASHV=liveV;
+    return EX.getImageData(0,0,EW,EH);
+  }
+  function finish(){btn.textContent=hd?'HD':'GIF';btn.disabled=false;other.disabled=false;EC.width=EC.height=0;}
+  btn.textContent='PAL';
+  setTimeout(function(){
+    // Palette from three spread samples — the scene's colours don't change
+    // between frames, only the dash positions do.
+    var pal=gifBuildPalette([frame(0),frame(dur/3),frame(2*dur/3)],samp),cmap=gifBuildColorMap(pal),lzw=[],fi=0;
+    function next(){
+      lzw.push(gifLZW(gifIndexFrame(frame(fi*(dur/nf)),cmap,dith),8));fi++;btn.textContent=fi+'/'+nf;
+      if(fi<nf)setTimeout(next,0);
+      else{btn.textContent='ASM';setTimeout(function(){
+        var gif=gifAssemble(EW,EH,pal,lzw,del),blob=new Blob([gif],{type:'image/gif'}),url=URL.createObjectURL(blob);
+        var a=document.createElement('a');a.href=url;a.download='bastion-'+(hd?'hd-':'')+Date.now()+'.gif';
+        document.body.appendChild(a);a.click();document.body.removeChild(a);
+        setTimeout(function(){URL.revokeObjectURL(url);},5000);
+        finish();
+      },0);}
+    }next();
+  },50);
+}
+
+// ════════════════════════════════════════════
+// BUTTON WIRING
+// ════════════════════════════════════════════
+
+document.getElementById('gifbtn').addEventListener('click',function(){exportGIF(false);});
+document.getElementById('hdbtn').addEventListener('click',function(){exportGIF(true);});
+document.getElementById('rotl').addEventListener('click',function(){rotateView(-1);});
+document.getElementById('rotr').addEventListener('click',function(){rotateView(1);});
+document.getElementById('zout').addEventListener('click',function(){setZoom(-1);});
+document.getElementById('zin').addEventListener('click',function(){setZoom(1);});
+
+// ════════════════════════════════════════════
+// INIT
+// ════════════════════════════════════════════
+
+// Keep ox/oy relative to the canvas centre so a resize (mobile URL bar
+// show/hide, orientation change) doesn't throw away the user's pan.
+function resize(){
+  var first=W===undefined,pw=W,ph=H;
+  W=C.width=innerWidth;H=C.height=innerHeight;
+  if(first)updateView();else{ox+=(W-pw)/2;oy+=(H-ph)/2;}
+}
+initDemo();resize();requestAnimationFrame(loop);addEventListener('resize',resize);
+</script>
+</body>
+</html>
